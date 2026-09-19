@@ -6,13 +6,26 @@ import rclpy
 
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
+
 from cv_bridge import CvBridge, CvBridgeError
+
 from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import PointStamped, TransformStamped
+
+import tf2_ros
+from tf2_geometry_msgs import do_transform_point
 
 
 COLOR_TOPIC = '/camera/camera/color/image_raw'
 DEPTH_TOPIC = '/camera/camera/aligned_depth_to_color/image_raw'
 CAMERA_INFO_TOPIC = '/camera/camera/color/camera_info'
+
+TARGET_FRAME = 'base_link'
+
+# Ore model height = 0.0762 m.
+# Camera depth measures the visible top face; Task 1A expects the ore middle.
+ORE_MIDDLE_OFFSET_Z = 0.0381
 
 
 class OreDetector(Node):
@@ -28,6 +41,29 @@ class OreDetector(Node):
 
         self.color_frame_id = None
         self.depth_frame_id = None
+
+        # -----------------------------------------------------
+        # TF2 listener
+        # -----------------------------------------------------
+
+        self.tf_buffer = tf2_ros.Buffer()
+
+        self.tf_listener = tf2_ros.TransformListener(
+            self.tf_buffer,
+            self
+        )
+
+        # -----------------------------------------------------
+        # TF broadcaster
+        # -----------------------------------------------------
+
+        self.tf_broadcaster = tf2_ros.TransformBroadcaster(
+            self
+        )
+
+        # -----------------------------------------------------
+        # Camera subscriptions
+        # -----------------------------------------------------
 
         self.color_sub = self.create_subscription(
             Image,
@@ -50,40 +86,58 @@ class OreDetector(Node):
             qos_profile_sensor_data
         )
 
-        self.timer = self.create_timer(0.5, self.process)
-
-        self.get_logger().info(
-            'Starting perception-only baseline...'
+        self.timer = self.create_timer(
+            0.5,
+            self.process
         )
 
+        self.get_logger().info(
+            'Starting Task 1A perception + TF publisher...'
+        )
+
+    # =========================================================
+    # CAMERA CALLBACKS
+    # =========================================================
+
     def color_callback(self, msg):
+
         try:
             self.color_image = self.bridge.imgmsg_to_cv2(
                 msg,
                 desired_encoding='bgr8'
             )
+
             self.color_frame_id = msg.header.frame_id
 
         except CvBridgeError as e:
+
             self.get_logger().error(
                 f'Color conversion failed: {e}'
             )
 
     def depth_callback(self, msg):
+
         try:
             self.depth_image = self.bridge.imgmsg_to_cv2(
                 msg,
                 desired_encoding='passthrough'
             )
+
             self.depth_frame_id = msg.header.frame_id
 
         except CvBridgeError as e:
+
             self.get_logger().error(
                 f'Depth conversion failed: {e}'
             )
 
     def info_callback(self, msg):
+
         self.camera_info = msg
+
+    # =========================================================
+    # ORE DETECTION
+    # =========================================================
 
     def detect_ores(self, image):
 
@@ -96,6 +150,7 @@ class OreDetector(Node):
         )
 
         color_ranges = {
+
             'azurite_ore': (
                 np.array([95, 180, 100]),
                 np.array([115, 255, 255])
@@ -145,14 +200,16 @@ class OreDetector(Node):
 
             for contour in contours:
 
-                area = cv2.contourArea(contour)
+                area = cv2.contourArea(
+                    contour
+                )
 
-                # Adjusted only because the current
-                # camera resolution is 640x480.
                 if area < 100 or area > 10000:
                     continue
 
-                moments = cv2.moments(contour)
+                moments = cv2.moments(
+                    contour
+                )
 
                 if moments['m00'] == 0:
                     continue
@@ -176,6 +233,10 @@ class OreDetector(Node):
                 )
 
         return center_ore_list, ore_type_list
+
+    # =========================================================
+    # DEPTH
+    # =========================================================
 
     def get_depth(self, u, v):
 
@@ -207,12 +268,118 @@ class OreDetector(Node):
             np.median(valid)
         )
 
+    # =========================================================
+    # CAMERA XYZ
+    # =========================================================
+
+    def camera_xyz(self, u, v, z):
+
+        fx = self.camera_info.k[0]
+        fy = self.camera_info.k[4]
+
+        cx = self.camera_info.k[2]
+        cy = self.camera_info.k[5]
+
+        x = (u - cx) * z / fx
+        y = (v - cy) * z / fy
+
+        return x, y, z
+
+    # =========================================================
+    # CAMERA → BASE_LINK
+    # =========================================================
+
+    def transform_to_base(
+        self,
+        x,
+        y,
+        z,
+        source_frame
+    ):
+
+        point_camera = PointStamped()
+
+        point_camera.header.frame_id = source_frame
+        point_camera.header.stamp = Time().to_msg()
+
+        point_camera.point.x = x
+        point_camera.point.y = y
+        point_camera.point.z = z
+
+        try:
+
+            transform = self.tf_buffer.lookup_transform(
+                TARGET_FRAME,
+                source_frame,
+                Time()
+            )
+
+            point_base = do_transform_point(
+                point_camera,
+                transform
+            )
+
+            return (
+                point_base.point.x,
+                point_base.point.y,
+                point_base.point.z
+            )
+
+        except Exception as e:
+
+            self.get_logger().warn(
+                f'TF transform failed '
+                f'{source_frame} -> {TARGET_FRAME}: {e}'
+            )
+
+            return None
+
+    # =========================================================
+    # PUBLISH ORE TF
+    # =========================================================
+
+    def publish_ore_tf(
+        self,
+        child_frame,
+        x,
+        y,
+        z
+    ):
+        z -= ORE_MIDDLE_OFFSET_Z
+
+        transform = TransformStamped()
+
+        transform.header.stamp = self.get_clock().now().to_msg()
+
+        transform.header.frame_id = TARGET_FRAME
+
+        transform.child_frame_id = child_frame
+
+        transform.transform.translation.x = x
+        transform.transform.translation.y = y
+        transform.transform.translation.z = z
+
+        # Ore frame has no special orientation yet.
+        # Use identity rotation.
+        transform.transform.rotation.x = 0.0
+        transform.transform.rotation.y = 0.0
+        transform.transform.rotation.z = 0.0
+        transform.transform.rotation.w = 1.0
+
+        self.tf_broadcaster.sendTransform(
+            transform
+        )
+
+    # =========================================================
+    # MAIN PROCESSING
+    # =========================================================
+
     def process(self):
 
         if (
-            self.color_image is None or
-            self.depth_image is None or
-            self.camera_info is None
+            self.color_image is None
+            or self.depth_image is None
+            or self.camera_info is None
         ):
             return
 
@@ -221,6 +388,10 @@ class OreDetector(Node):
         centers, ore_types = self.detect_ores(
             display_image
         )
+
+        # -----------------------------------------------------
+        # Draw detections
+        # -----------------------------------------------------
 
         for (u, v), ore_type in zip(
             centers,
@@ -253,21 +424,18 @@ class OreDetector(Node):
         cv2.waitKey(1)
 
         if not centers:
+
             self.get_logger().warn(
                 'No ores detected.'
             )
+
             return
 
-        fx = self.camera_info.k[0]
-        fy = self.camera_info.k[4]
-        cx = self.camera_info.k[2]
-        cy = self.camera_info.k[5]
+        # -----------------------------------------------------
+        # Convert every detection to base_link
+        # -----------------------------------------------------
 
-        self.get_logger().info(
-            f'Detected {len(centers)} ores | '
-            f'color_frame={self.color_frame_id} | '
-            f'depth_frame={self.depth_frame_id}'
-        )
+        detected_ores = []
 
         for (u, v), ore_type in zip(
             centers,
@@ -280,40 +448,133 @@ class OreDetector(Node):
             )
 
             if z is None:
+
                 self.get_logger().warn(
-                    f'{ore_type}: no valid depth at '
+                    f'{ore_type}: '
+                    f'no valid depth at '
                     f'pixel=({u},{v})'
                 )
+
                 continue
 
-            x = (u - cx) * z / fx
-            y = (v - cy) * z / fy
-
-            self.get_logger().info(
-                f'{ore_type}: '
-                f'pixel=({u}, {v}), '
-                f'camera_xyz=({x:.3f}, '
-                f'{y:.3f}, {z:.3f}) m'
+            x, y, z = self.camera_xyz(
+                u,
+                v,
+                z
             )
+
+            base_xyz = self.transform_to_base(
+                x,
+                y,
+                z,
+                self.color_frame_id
+            )
+
+            if base_xyz is None:
+                continue
+
+            bx, by, bz = base_xyz
+
+            detected_ores.append(
+                {
+                    'type': ore_type,
+                    'pixel': (u, v),
+                    'camera_xyz': (x, y, z),
+                    'base_xyz': (bx, by, bz)
+                }
+            )
+
+        # -----------------------------------------------------
+        # Group by ore type
+        # -----------------------------------------------------
+
+        ore_groups = {
+            'azurite_ore': [],
+            'malachite_ore': [],
+            'vanadinite_ore': []
+        }
+
+        for ore in detected_ores:
+
+            ore_groups[
+                ore['type']
+            ].append(ore)
+
+        # -----------------------------------------------------
+        # Assign _1 and _2
+        #
+        # Sort by base_link X.
+        # Smaller X → _1
+        # Larger X → _2
+        # -----------------------------------------------------
+
+        for ore_type, ores in ore_groups.items():
+
+            ores.sort(
+                key=lambda item:
+                item['base_xyz'][0]
+            )
+
+            for index, ore in enumerate(
+                ores[:2],
+                start=1
+            ):
+
+                bx, by, bz = ore['base_xyz']
+
+                child_frame = (
+                    f'{ore_type}_{index}'
+                )
+
+                self.publish_ore_tf(
+                    child_frame,
+                    bx,
+                    by,
+                    bz
+                )
+
+                self.get_logger().info(
+                    f'Published {child_frame}: '
+                    f'({bx:.3f}, '
+                    f'{by:.3f}, '
+                    f'{bz - ORE_MIDDLE_OFFSET_Z:.3f}) m'
+                )
+
+            if len(ores) != 2:
+
+                self.get_logger().warn(
+                    f'{ore_type}: '
+                    f'expected 2 detections, '
+                    f'got {len(ores)}'
+                )
 
 
 def main(args=None):
 
-    rclpy.init(args=args)
+    rclpy.init(
+        args=args
+    )
 
     node = OreDetector()
 
     try:
-        rclpy.spin(node)
+
+        rclpy.spin(
+            node
+        )
 
     except KeyboardInterrupt:
         pass
 
     finally:
+
         cv2.destroyAllWindows()
+
         node.destroy_node()
+
         rclpy.shutdown()
 
 
 if __name__ == '__main__':
+
     main()
